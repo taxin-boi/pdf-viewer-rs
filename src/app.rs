@@ -35,7 +35,6 @@ pub struct PdfApp {
     zoom: f32,
     show_sidebar: bool,
     dark_mode: bool,
-    search_query: String,
     cache: lru::LruCache<usize, TextureHandle>,
     outline: Vec<crate::document::OutlineItem>,
     
@@ -58,7 +57,6 @@ impl PdfApp {
             zoom: 1.0,
             show_sidebar: true,
             dark_mode: true,
-            search_query: String::new(),
             cache: lru::LruCache::new(std::num::NonZeroUsize::new(50).unwrap()),
             outline: Vec::new(),
             tool: Tool::None,
@@ -119,20 +117,31 @@ impl PdfApp {
         }
     }
 
-    fn draw_annotations(&self, ui: &mut egui::Ui, page: usize) {
+    fn draw_annotations(&self, ui: &mut egui::Ui, page: usize, rect: egui::Rect) {
         if let Some(strokes) = self.annotations.get(&page) {
             for stroke in strokes {
                 match &stroke.stroke_type {
                     StrokeType::Highlight(color) => {
-                        for point in &stroke.points {
-                            ui.painter().circle_filled(*point, stroke.width, *color);
+                        if stroke.points.len() > 1 {
+                            let screen_points: Vec<egui::Pos2> = stroke.points.iter().map(|p| {
+                                egui::Pos2::new(p.x + rect.min.x, p.y + rect.min.y)
+                            }).collect();
+                            ui.painter().add(egui::Shape::line(
+                                screen_points,
+                                egui::Stroke::new(stroke.width, *color),
+                            ));
                         }
                     }
                     StrokeType::Pen(color) => {
-                        ui.painter().add(egui::Shape::line(
-                            stroke.points.clone(),
-                            egui::Stroke::new(stroke.width, *color),
-                        ));
+                        if stroke.points.len() > 1 {
+                            let screen_points: Vec<egui::Pos2> = stroke.points.iter().map(|p| {
+                                egui::Pos2::new(p.x + rect.min.x, p.y + rect.min.y)
+                            }).collect();
+                            ui.painter().add(egui::Shape::line(
+                                screen_points,
+                                egui::Stroke::new(stroke.width, *color),
+                            ));
+                        }
                     }
                 }
             }
@@ -177,14 +186,50 @@ impl eframe::App for PdfApp {
                     if ui.button("-").clicked() { self.zoom = (self.zoom - 0.1).max(0.2); }
                     ui.add(egui::DragValue::new(&mut self.zoom).range(0.2..=3.0).speed(0.05).suffix("x"));
                     if ui.button("+").clicked() { self.zoom = (self.zoom + 0.1).min(3.0); }
-                    if ui.button("Fit Width").clicked() { self.zoom = 1.0; }
 
                     ui.separator();
                     ui.toggle_value(&mut self.show_sidebar, "☰ Outline");
                     ui.toggle_value(&mut self.dark_mode, "🌙 Dark");
 
                     ui.separator();
-                    ui.text_edit_singleline(&mut self.search_query);
+                    
+                    ui.label("Tool:");
+                    if ui.selectable_label(self.tool == Tool::None, "🖱 View").clicked() {
+                        self.tool = Tool::None;
+                    }
+                    if ui.selectable_label(self.tool == Tool::Pen, "✏ Pen").clicked() {
+                        self.tool = Tool::Pen;
+                    }
+                    if ui.selectable_label(self.tool == Tool::Highlight, "🖍 Highlight").clicked() {
+                        self.tool = Tool::Highlight;
+                    }
+                    if ui.selectable_label(self.tool == Tool::Eraser, "🧹 Eraser").clicked() {
+                        self.tool = Tool::Eraser;
+                    }
+
+                    if !matches!(self.tool, Tool::None) {
+                        ui.separator();
+                        ui.label("Width:");
+                        ui.add(egui::Slider::new(&mut self.stroke_width, 1.0..=30.0));
+
+                        match self.tool {
+                            Tool::Pen => {
+                                ui.label("Color:");
+                                ui.color_edit_button_srgba(&mut self.pen_color);
+                            }
+                            Tool::Highlight => {
+                                ui.label("Color:");
+                                ui.color_edit_button_srgba(&mut self.highlight_color);
+                            }
+                            Tool::Eraser => {}
+                            Tool::None => {}
+                        }
+
+                        ui.separator();
+                        if ui.button("🗑 Clear").clicked() {
+                            self.clear_page_annotations();
+                        }
+                    }
                 }
             });
         });
@@ -207,141 +252,99 @@ impl eframe::App for PdfApp {
                 });
             });
 
-            egui::SidePanel::right("tools").show(ctx, |ui| {
-                ui.heading("Tools");
-                ui.separator();
-                
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(self.tool == Tool::None, "🖱 View").clicked() {
-                        self.tool = Tool::None;
-                    }
-                    if ui.selectable_label(self.tool == Tool::Pen, "✏ Pen").clicked() {
-                        self.tool = Tool::Pen;
-                    }
-                    if ui.selectable_label(self.tool == Tool::Highlight, "🖍 Highlight").clicked() {
-                        self.tool = Tool::Highlight;
-                    }
-                    if ui.selectable_label(self.tool == Tool::Eraser, "🧹 Eraser").clicked() {
-                        self.tool = Tool::Eraser;
-                    }
-                });
-
-                ui.separator();
-                ui.label("Width:");
-                ui.add(egui::Slider::new(&mut self.stroke_width, 1.0..=20.0));
-
-                match self.tool {
-                    Tool::Pen => {
-                        ui.label("Color:");
-                        ui.color_edit_button_srgba(&mut self.pen_color);
-                    }
-                    Tool::Highlight => {
-                        ui.label("Color:");
-                        ui.color_edit_button_srgba(&mut self.highlight_color);
-                    }
-                    Tool::Eraser => {
-                        ui.label("Size:");
-                        ui.add(egui::Slider::new(&mut self.stroke_width, 5.0..=50.0));
-                    }
-                    Tool::None => {}
-                }
-
-                ui.separator();
-                if ui.button("🗑 Clear Page").clicked() {
-                    self.clear_page_annotations();
-                }
-            });
-
             egui::CentralPanel::default().show(ctx, |ui| {
-                if let Some(texture) = self.render_page_to_texture(ctx, self.current_page) {
-                    let image_size = texture.size_vec2();
-                    let (rect, _response) = ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
-                    ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    if let Some(texture) = self.render_page_to_texture(ctx, self.current_page) {
+                        let image_size = texture.size_vec2();
+                        
+                        ui.horizontal_centered(|ui| {
+                            let (rect, _response) = ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+                            ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
 
-                    self.draw_annotations(ui, self.current_page);
+                            self.draw_annotations(ui, self.current_page, rect);
 
-                    if !matches!(self.tool, Tool::None) {
-                        let pointer = ui.input(|i| i.pointer.interact_pos());
-                        let is_pressed = ui.input(|i| i.pointer.primary_down());
+                            if !matches!(self.tool, Tool::None) {
+                                let pointer = ui.input(|i| i.pointer.interact_pos());
+                                let is_pressed = ui.input(|i| i.pointer.primary_down());
 
-                        if let Some(pos) = pointer {
-                            if rect.contains(pos) {
-                                let local_pos = egui::Pos2::new(
-                                    (pos.x - rect.min.x) / self.zoom,
-                                    (pos.y - rect.min.y) / self.zoom,
-                                );
+                                if let Some(pos) = pointer {
+                                    if rect.contains(pos) {
+                                        let local_pos = egui::Pos2::new(pos.x - rect.min.x, pos.y - rect.min.y);
 
-                                if is_pressed {
-                                    if !self.is_drawing {
-                                        self.is_drawing = true;
-                                        let stroke_type = match self.tool {
-                                            Tool::Pen => StrokeType::Pen(self.pen_color),
-                                            Tool::Highlight => StrokeType::Highlight(self.highlight_color),
-                                            Tool::Eraser => StrokeType::Pen(self.pen_color),
-                                            Tool::None => StrokeType::Pen(self.pen_color),
-                                        };
-                                        self.current_stroke = Some(Stroke {
-                                            points: vec![local_pos],
-                                            stroke_type,
-                                            width: self.stroke_width,
-                                        });
-                                    } else if let Some(ref mut stroke) = self.current_stroke {
-                                        stroke.points.push(local_pos);
-                                    }
-                                    
-                                    if self.tool == Tool::Eraser {
-                                        self.erase_at_point(local_pos, self.stroke_width);
-                                    }
-                                } else {
-                                    if self.is_drawing {
-                                        if let Some(stroke) = self.current_stroke.take() {
-                                            if !matches!(self.tool, Tool::Eraser) {
-                                                self.annotations.entry(self.current_page).or_insert_with(Vec::new).push(stroke);
+                                        if is_pressed {
+                                            if !self.is_drawing {
+                                                self.is_drawing = true;
+                                                let stroke_type = match self.tool {
+                                                    Tool::Pen => StrokeType::Pen(self.pen_color),
+                                                    Tool::Highlight => StrokeType::Highlight(self.highlight_color),
+                                                    Tool::Eraser => StrokeType::Pen(self.pen_color),
+                                                    Tool::None => StrokeType::Pen(self.pen_color),
+                                                };
+                                                self.current_stroke = Some(Stroke {
+                                                    points: vec![local_pos],
+                                                    stroke_type,
+                                                    width: self.stroke_width,
+                                                });
+                                            } else if let Some(ref mut stroke) = self.current_stroke {
+                                                stroke.points.push(local_pos);
+                                            }
+                                            
+                                            if self.tool == Tool::Eraser {
+                                                self.erase_at_point(local_pos, self.stroke_width);
+                                            }
+                                        } else {
+                                            if self.is_drawing {
+                                                if let Some(stroke) = self.current_stroke.take() {
+                                                    if !matches!(self.tool, Tool::Eraser) {
+                                                        self.annotations.entry(self.current_page).or_insert_with(Vec::new).push(stroke);
+                                                    }
+                                                }
+                                                self.is_drawing = false;
                                             }
                                         }
-                                        self.is_drawing = false;
+                                    }
+                                }
+
+                                if let Some(ref stroke) = self.current_stroke {
+                                    match &stroke.stroke_type {
+                                        StrokeType::Highlight(color) => {
+                                            if stroke.points.len() > 1 {
+                                                let screen_points: Vec<egui::Pos2> = stroke.points.iter().map(|p| {
+                                                    egui::Pos2::new(p.x + rect.min.x, p.y + rect.min.y)
+                                                }).collect();
+                                                ui.painter().add(egui::Shape::line(
+                                                    screen_points,
+                                                    egui::Stroke::new(stroke.width, *color),
+                                                ));
+                                            }
+                                        }
+                                        StrokeType::Pen(color) => {
+                                            if stroke.points.len() > 1 {
+                                                let screen_points: Vec<egui::Pos2> = stroke.points.iter().map(|p| {
+                                                    egui::Pos2::new(p.x + rect.min.x, p.y + rect.min.y)
+                                                }).collect();
+                                                ui.painter().add(egui::Shape::line(
+                                                    screen_points,
+                                                    egui::Stroke::new(stroke.width, *color),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if self.tool == Tool::Eraser {
+                                    if let Some(pos) = pointer {
+                                        ui.painter().circle_stroke(pos, self.stroke_width, egui::Stroke::new(1.0, egui::Color32::RED));
                                     }
                                 }
                             }
-                        }
-
-                        if let Some(ref stroke) = self.current_stroke {
-                            match &stroke.stroke_type {
-                                StrokeType::Highlight(color) => {
-                                    for point in &stroke.points {
-                                        let screen_pos = egui::Pos2::new(
-                                            point.x * self.zoom + rect.min.x,
-                                            point.y * self.zoom + rect.min.y,
-                                        );
-                                        ui.painter().circle_filled(screen_pos, stroke.width * self.zoom, *color);
-                                    }
-                                }
-                                StrokeType::Pen(color) => {
-                                    let screen_points: Vec<egui::Pos2> = stroke.points.iter().map(|p| {
-                                        egui::Pos2::new(
-                                            p.x * self.zoom + rect.min.x,
-                                            p.y * self.zoom + rect.min.y,
-                                        )
-                                    }).collect();
-                                    ui.painter().add(egui::Shape::line(
-                                        screen_points,
-                                        egui::Stroke::new(stroke.width * self.zoom, *color),
-                                    ));
-                                }
-                            }
-                        }
-
-                        if self.tool == Tool::Eraser {
-                            if let Some(pos) = pointer {
-                                ui.painter().circle_stroke(pos, self.stroke_width * self.zoom, egui::Stroke::new(1.0, egui::Color32::RED));
-                            }
-                        }
+                        });
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Rendering...");
+                        });
                     }
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("Rendering...");
-                    });
-                }
+                });
             });
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
