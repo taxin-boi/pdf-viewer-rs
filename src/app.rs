@@ -2,23 +2,50 @@ use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use crate::config::AppConfig;
 use crate::document::PdfDocument;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tool {
+    None,
+    Pen,
+    Highlight,
+    Eraser,
+}
+
+#[derive(Clone, Debug)]
+pub enum StrokeType {
+    Pen(egui::Color32),
+    Highlight(egui::Color32),
+}
+
+#[derive(Clone, Debug)]
+pub struct Stroke {
+    pub points: Vec<egui::Pos2>,
+    pub stroke_type: StrokeType,
+    pub width: f32,
+}
 
 pub struct PdfApp {
     config: AppConfig,
     doc: Option<Arc<Mutex<PdfDocument>>>,
     current_page: usize,
     zoom: f32,
-    continuous_scroll: bool,
     show_sidebar: bool,
-    show_thumbnails: bool,
     dark_mode: bool,
     search_query: String,
-    search_results: Vec<(usize, String)>,
     cache: lru::LruCache<usize, TextureHandle>,
     outline: Vec<crate::document::OutlineItem>,
+    
+    pub tool: Tool,
+    pub pen_color: egui::Color32,
+    pub highlight_color: egui::Color32,
+    pub stroke_width: f32,
+    pub annotations: HashMap<usize, Vec<Stroke>>,
+    pub current_stroke: Option<Stroke>,
+    pub is_drawing: bool,
 }
 
 impl PdfApp {
@@ -29,14 +56,18 @@ impl PdfApp {
             doc: None,
             current_page: 0,
             zoom: 1.0,
-            continuous_scroll: true,
             show_sidebar: true,
-            show_thumbnails: false,
             dark_mode: true,
             search_query: String::new(),
-            search_results: Vec::new(),
             cache: lru::LruCache::new(std::num::NonZeroUsize::new(50).unwrap()),
             outline: Vec::new(),
+            tool: Tool::None,
+            pen_color: egui::Color32::BLACK,
+            highlight_color: egui::Color32::from_rgba_unmultiplied(255, 255, 0, 80),
+            stroke_width: 2.0,
+            annotations: HashMap::new(),
+            current_stroke: None,
+            is_drawing: false,
         }
     }
 
@@ -47,6 +78,7 @@ impl PdfApp {
             self.current_page = 0;
             self.zoom = 1.0;
             self.cache.clear();
+            self.annotations.clear();
             if let Ok(doc) = self.doc.as_ref().unwrap().lock() {
                 self.outline = doc.get_outline().unwrap_or_default();
             }
@@ -69,6 +101,42 @@ impl PdfApp {
             }
         }
         None
+    }
+
+    fn clear_page_annotations(&mut self) {
+        self.annotations.remove(&self.current_page);
+    }
+
+    fn erase_at_point(&mut self, pos: egui::Pos2, radius: f32) {
+        if let Some(strokes) = self.annotations.get_mut(&self.current_page) {
+            strokes.retain(|stroke| {
+                stroke.points.iter().all(|p| {
+                    let dx = p.x - pos.x;
+                    let dy = p.y - pos.y;
+                    (dx * dx + dy * dy) > radius * radius
+                })
+            });
+        }
+    }
+
+    fn draw_annotations(&self, ui: &mut egui::Ui, page: usize) {
+        if let Some(strokes) = self.annotations.get(&page) {
+            for stroke in strokes {
+                match &stroke.stroke_type {
+                    StrokeType::Highlight(color) => {
+                        for point in &stroke.points {
+                            ui.painter().circle_filled(*point, stroke.width, *color);
+                        }
+                    }
+                    StrokeType::Pen(color) => {
+                        ui.painter().add(egui::Shape::line(
+                            stroke.points.clone(),
+                            egui::Stroke::new(stroke.width, *color),
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -113,23 +181,10 @@ impl eframe::App for PdfApp {
 
                     ui.separator();
                     ui.toggle_value(&mut self.show_sidebar, "☰ Outline");
-                    ui.toggle_value(&mut self.show_thumbnails, "🖼 Thumbs");
                     ui.toggle_value(&mut self.dark_mode, "🌙 Dark");
 
                     ui.separator();
                     ui.text_edit_singleline(&mut self.search_query);
-                    if ui.button("Search").clicked() {
-                        self.search_results.clear();
-                        if let Ok(doc) = doc.lock() {
-                            for p in 0..page_count {
-                                if let Ok(text) = doc.get_text(p) {
-                                    if text.to_lowercase().contains(&self.search_query.to_lowercase()) {
-                                        self.search_results.push((p, "Found".to_string()));
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             });
         });
@@ -152,11 +207,136 @@ impl eframe::App for PdfApp {
                 });
             });
 
+            egui::SidePanel::right("tools").show(ctx, |ui| {
+                ui.heading("Tools");
+                ui.separator();
+                
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.tool == Tool::None, "🖱 View").clicked() {
+                        self.tool = Tool::None;
+                    }
+                    if ui.selectable_label(self.tool == Tool::Pen, "✏ Pen").clicked() {
+                        self.tool = Tool::Pen;
+                    }
+                    if ui.selectable_label(self.tool == Tool::Highlight, "🖍 Highlight").clicked() {
+                        self.tool = Tool::Highlight;
+                    }
+                    if ui.selectable_label(self.tool == Tool::Eraser, "🧹 Eraser").clicked() {
+                        self.tool = Tool::Eraser;
+                    }
+                });
+
+                ui.separator();
+                ui.label("Width:");
+                ui.add(egui::Slider::new(&mut self.stroke_width, 1.0..=20.0));
+
+                match self.tool {
+                    Tool::Pen => {
+                        ui.label("Color:");
+                        ui.color_edit_button_srgba(&mut self.pen_color);
+                    }
+                    Tool::Highlight => {
+                        ui.label("Color:");
+                        ui.color_edit_button_srgba(&mut self.highlight_color);
+                    }
+                    Tool::Eraser => {
+                        ui.label("Size:");
+                        ui.add(egui::Slider::new(&mut self.stroke_width, 5.0..=50.0));
+                    }
+                    Tool::None => {}
+                }
+
+                ui.separator();
+                if ui.button("🗑 Clear Page").clicked() {
+                    self.clear_page_annotations();
+                }
+            });
+
             egui::CentralPanel::default().show(ctx, |ui| {
                 if let Some(texture) = self.render_page_to_texture(ctx, self.current_page) {
-                    ui.centered_and_justified(|ui| {
-                        ui.image(&texture);
-                    });
+                    let image_size = texture.size_vec2();
+                    let (rect, _response) = ui.allocate_exact_size(image_size, egui::Sense::click_and_drag());
+                    ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+
+                    self.draw_annotations(ui, self.current_page);
+
+                    if !matches!(self.tool, Tool::None) {
+                        let pointer = ui.input(|i| i.pointer.interact_pos());
+                        let is_pressed = ui.input(|i| i.pointer.primary_down());
+
+                        if let Some(pos) = pointer {
+                            if rect.contains(pos) {
+                                let local_pos = egui::Pos2::new(
+                                    (pos.x - rect.min.x) / self.zoom,
+                                    (pos.y - rect.min.y) / self.zoom,
+                                );
+
+                                if is_pressed {
+                                    if !self.is_drawing {
+                                        self.is_drawing = true;
+                                        let stroke_type = match self.tool {
+                                            Tool::Pen => StrokeType::Pen(self.pen_color),
+                                            Tool::Highlight => StrokeType::Highlight(self.highlight_color),
+                                            Tool::Eraser => StrokeType::Pen(self.pen_color),
+                                            Tool::None => StrokeType::Pen(self.pen_color),
+                                        };
+                                        self.current_stroke = Some(Stroke {
+                                            points: vec![local_pos],
+                                            stroke_type,
+                                            width: self.stroke_width,
+                                        });
+                                    } else if let Some(ref mut stroke) = self.current_stroke {
+                                        stroke.points.push(local_pos);
+                                    }
+                                    
+                                    if self.tool == Tool::Eraser {
+                                        self.erase_at_point(local_pos, self.stroke_width);
+                                    }
+                                } else {
+                                    if self.is_drawing {
+                                        if let Some(stroke) = self.current_stroke.take() {
+                                            if !matches!(self.tool, Tool::Eraser) {
+                                                self.annotations.entry(self.current_page).or_insert_with(Vec::new).push(stroke);
+                                            }
+                                        }
+                                        self.is_drawing = false;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(ref stroke) = self.current_stroke {
+                            match &stroke.stroke_type {
+                                StrokeType::Highlight(color) => {
+                                    for point in &stroke.points {
+                                        let screen_pos = egui::Pos2::new(
+                                            point.x * self.zoom + rect.min.x,
+                                            point.y * self.zoom + rect.min.y,
+                                        );
+                                        ui.painter().circle_filled(screen_pos, stroke.width * self.zoom, *color);
+                                    }
+                                }
+                                StrokeType::Pen(color) => {
+                                    let screen_points: Vec<egui::Pos2> = stroke.points.iter().map(|p| {
+                                        egui::Pos2::new(
+                                            p.x * self.zoom + rect.min.x,
+                                            p.y * self.zoom + rect.min.y,
+                                        )
+                                    }).collect();
+                                    ui.painter().add(egui::Shape::line(
+                                        screen_points,
+                                        egui::Stroke::new(stroke.width * self.zoom, *color),
+                                    ));
+                                }
+                            }
+                        }
+
+                        if self.tool == Tool::Eraser {
+                            if let Some(pos) = pointer {
+                                ui.painter().circle_stroke(pos, self.stroke_width * self.zoom, egui::Stroke::new(1.0, egui::Color32::RED));
+                            }
+                        }
+                    }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label("Rendering...");
@@ -170,10 +350,14 @@ impl eframe::App for PdfApp {
                     ui.label("No document open. Click 'Open' to select a PDF.");
                     if !self.config.recent_files.is_empty() {
                         ui.label("Recent files:");
+                        let mut clicked_path = None;
                         for recent in &self.config.recent_files {
                             if ui.button(recent.to_string_lossy()).clicked() {
-                                self.open_file(recent.clone());
+                                clicked_path = Some(recent.clone());
                             }
+                        }
+                        if let Some(path) = clicked_path {
+                            self.open_file(path);
                         }
                     }
                 });

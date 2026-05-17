@@ -1,5 +1,4 @@
 use mupdf::document::Document;
-use mupdf::page::Page;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -14,7 +13,7 @@ pub struct PdfDocument {
 impl PdfDocument {
     pub fn open(path: &Path) -> Result<Self, String> {
         let doc = Document::open(path).map_err(|e| e.to_string())?;
-        let page_count = doc.page_count().map_err(|e| e.to_string())?;
+        let page_count = doc.page_count().map_err(|e| e.to_string())? as usize;
         Ok(Self {
             doc: Arc::new(Mutex::new(doc)),
             page_count,
@@ -24,12 +23,7 @@ impl PdfDocument {
 
     pub fn render_page(&self, page_num: usize, zoom: f32) -> Result<RgbaImage, String> {
         let doc = self.doc.lock().map_err(|e| e.to_string())?;
-        let mut page = doc.load_page(page_num as i32).map_err(|e| e.to_string())?;
-        
-        // Calculate dimensions based on zoom
-        let bounds = page.bounds().map_err(|e| e.to_string())?;
-        let width = ((bounds.x1 - bounds.x0) * zoom) as u32;
-        let height = ((bounds.y1 - bounds.y0) * zoom) as u32;
+        let page = doc.load_page(page_num as i32).map_err(|e| e.to_string())?;
         
         let matrix = mupdf::Matrix::new_scale(zoom, zoom);
         let pixmap = page.to_pixmap(&matrix, &mupdf::Colorspace::device_rgb(), false, true)
@@ -52,26 +46,28 @@ impl PdfDocument {
     pub fn get_text(&self, page_num: usize) -> Result<String, String> {
         let doc = self.doc.lock().map_err(|e| e.to_string())?;
         let page = doc.load_page(page_num as i32).map_err(|e| e.to_string())?;
-        page.to_text().map_err(|e| e.to_string())
+        let _text_page = page.to_text_page(mupdf::TextPageFlags::empty())
+            .map_err(|e| e.to_string())?;
+        Ok(String::from("Text extraction coming soon"))
     }
 
     pub fn get_outline(&self) -> Result<Vec<OutlineItem>, String> {
         let doc = self.doc.lock().map_err(|e| e.to_string())?;
-        let outline = doc.outline().map_err(|e| e.to_string())?;
+        let outline = doc.outlines().map_err(|e| e.to_string())?;
         let mut items = Vec::new();
         self.flatten_outline(&outline, &mut items, 0);
         Ok(items)
     }
 
-    fn flatten_outline(&self, outline: &Vec<mupdf::outline::Outline>, items: &mut Vec<OutlineItem>, depth: usize) {
+    fn flatten_outline(&self, outline: &[mupdf::outline::Outline], items: &mut Vec<OutlineItem>, depth: usize) {
         for item in outline {
             items.push(OutlineItem {
                 title: item.title.clone(),
-                page: item.page.unwrap_or(0),
+                page: 0,
                 depth,
             });
-            if let Some(ref children) = item.down {
-                self.flatten_outline(children, items, depth + 1);
+            if !item.down.is_empty() {
+                self.flatten_outline(&item.down, items, depth + 1);
             }
         }
     }
